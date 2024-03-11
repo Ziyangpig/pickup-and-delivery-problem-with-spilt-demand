@@ -4,7 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logging.basicConfig(level=logging.DEBUG)
 
 
 class _MasterSolve():
@@ -40,16 +40,16 @@ class _MasterSolve():
         # Route selection variables
         if relax:
             for i,v in self.routes.items():
-                self.x[i] = self.prob.addVars(len(v), lb=0,ub=1,vtype = gp.GRB.CONTINUOUS)
+                self.x[i] = self.prob.addVars(len(v), lb=0,ub=1,vtype = gp.GRB.CONTINUOUS,name='x')
             # chartering variable
             for item in self.orders:
-                self.y[item['id']] = self.prob.addVar(0,1,vtype = gp.GRB.CONTINUOUS)
+                self.y[item['id']] = self.prob.addVar(0,1,vtype = gp.GRB.CONTINUOUS,name='y')
         else:
             for i,v in self.routes.items():
-                self.x[i] = self.prob.addVars(len(v), lb=0,ub=1,vtype = gp.GRB.BINARY)
+                self.x[i] = self.prob.addVars(len(v), lb=0,ub=1,vtype = gp.GRB.BINARY,name='x')
             # chartering variable
             for item in self.orders:
-                self.y[item['id']] = self.prob.addVar(0,1,vtype = gp.GRB.BINARY)
+                self.y[item['id']] = self.prob.addVar(0,1,vtype = gp.GRB.BINARY,name='y')
         # Add route-selection const
         for i in self.routes.keys():
             self.prob.addConstr((self.x[i].sum() <= 1),name="route_selection")
@@ -57,9 +57,9 @@ class _MasterSolve():
         for item in self.orders:
             temp_LinExpr = gp.LinExpr()
             for i,v in self.routes.items():
-                q=dict([[j, r['q'][item['id']-1]] for j,r in enumerate(v)])
+                q=dict([[j, r['q'][item['id']]] for j,r in enumerate(v)])
                 temp_LinExpr.add(self.x[i].prod(q))
-            self.prob.addConstr((temp_LinExpr == item['Q']*(1-self.y[item['id']])),name="demand_const")
+            self.prob.addConstr((temp_LinExpr >= item['Q']*(1-self.y[item['id']])),name="demand_const")
 
         # Set objective function
         costs = [-order['C'] for order in self.orders]

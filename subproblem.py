@@ -1,7 +1,10 @@
 import logging
 import gurobipy as gp
+import time
 
 logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.DEBUG)
 
 
 class _SubProblemLP:
@@ -12,7 +15,7 @@ class _SubProblemLP:
     Inherits problem parameters from `SubproblemBase`
     """
 
-    def __init__(self, duals,G,N,orders, vehicle, solver):
+    def __init__(self, duals,G,N,orders, vehicle, solver, gap=0):
         # Input attributes
         self.G = G
         self.N = N
@@ -32,6 +35,16 @@ class _SubProblemLP:
 
         # create problem
         self.prob = gp.Model("SubProblem")
+        # self.prob.setParam('OutputFlag', 0)
+
+
+        # # 终止条件：设置目标值大于指定值时终止的阈值
+        self.target_value_threshold = max(-min(self.duals['demand_const']),0)
+        self.subGap = gap
+
+        # self.prob.setParam('MIPGap', self.subGap)
+
+
         # flow variables
 
         self.x = self.prob.addVars(r,r,ub=1,lb=0,vtype=gp.GRB.BINARY,name='x')
@@ -40,6 +53,16 @@ class _SubProblemLP:
         self.tl = self.prob.addVars(r,vtype=gp.GRB.CONTINUOUS,name='tl')
         self.ta = self.prob.addVars(r,vtype=gp.GRB.CONTINUOUS,name='ta')
         self.u = self.prob.addVars(r, vtype=gp.GRB.CONTINUOUS,name='u')
+
+     # 创建回调函数，在其中检查终止条件
+    def _gap_and_obj_stop_callback(self,model, where):
+        if where == gp.GRB.Callback.MIPSOL:
+            # 检查当前最优目标值是否大于指定值，并且满足 gap 条件
+            gap = ((model.cbGet(gp.GRB.Callback.MIPSOL_OBJBND) - model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST)) / abs(
+                model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST)))
+
+            if model.cbGet(gp.GRB.Callback.MIPSOL_OBJ) > self.target_value_threshold and gap < self.subGap:
+                model.terminate()
 
     def solve(self, time_limit=None):
         if time_limit and time_limit <= 0:
@@ -68,38 +91,41 @@ class _SubProblemLP:
             if time_limit is not None:
                 self.prob.setParam("TimeLimit", time_limit)  # 设置时间限制
 
-            self.prob.optimize()
+            self.prob.optimize(callback=self._gap_and_obj_stop_callback)
+            # self.prob.optimize()
 
     def _formulate(self):
         # flow balance
         for ii in range(self.portnum):
             if ii == 0:
-                self.prob.addConstr(self.x.sum(ii,'*')==1)
+                self.prob.addConstr(self.x.sum(ii,'*')==1,'start_point')
             elif ii == self.portnum-1:
-                self.prob.addConstr(self.x.sum('*',ii ) == 1)
+                self.prob.addConstr(self.x.sum('*',ii ) == 1,'end_point')
             else:
-                self.prob.addConstr(self.x.sum(ii,'*') == self.x.sum('*',ii ))
+                self.prob.addConstr(self.x.sum(ii,'*') == self.x.sum('*',ii ),'flow_balance')
         # 每个点最多只能访问一次
-        self.prob.addConstrs((self.x.sum(ii, '*') <= 1 for ii in range(self.portnum-1)),)
+        self.prob.addConstrs((self.x.sum(ii, '*') <= 1 for ii in range(self.portnum-1)),'visit_1')
         # 不能单点自循环
-        self.prob.addConstrs((self.x.sum(ii, ii) == 0 for ii in range(self.portnum)),)
+        self.prob.addConstrs((self.x.sum(ii, ii) == 0 for ii in range(self.portnum)),'point_circle')
         # order finish
         for i in range(self.ordernum):
-            self.prob.addConstr(self.x.sum(i+1, '*') == self.x.sum(i+self.ordernum, '*'))
+            self.prob.addConstr(self.x.sum(i+1, '*') == self.x.sum(i+1+self.ordernum, '*'),'order_finish')
         # load
         for j in range(self.ordernum+1):
             if j == 0:
                 self.prob.addConstr(self.l[j] == 0)
             else:
-                self.prob.addConstrs(self.l[i]+self.q[j-1] <= self.l[j] + self.vehicle['K']*(1-self.x[(i,j)]) for i in range(self.portnum))
+                self.prob.addConstrs((self.l[i]+self.q[j-1] <= self.l[j] + self.vehicle['K']*(1-self.x[(i,j)])
+                                                                            for i in range(self.portnum)),name='load')
         for j in range(self.ordernum+1):
             if j == 0:
                 self.prob.addConstr(self.l[self.portnum-1] == 0)
             else:
-                self.prob.addConstrs((self.l[i] - self.q[j-1] <= self.l[j+self.ordernum] + self.vehicle['K'] * (1 - self.x[(i, j+self.ordernum)]) for i in range(self.portnum)))
+                self.prob.addConstrs((self.l[i] - self.q[j-1] <= self.l[j+self.ordernum] + self.vehicle['K'] * (1 - self.x[(i, j+self.ordernum)])
+                                                                            for i in range(self.portnum)),name='unload')
         # capacity const
         for j in range(self.ordernum):
-            self.prob.addConstr(self.l[j + 1 + self.ordernum]+self.q[j] <= self.vehicle['K']*self.x.sum(j+1,'*'))
+            self.prob.addConstr((self.l[j + 1 + self.ordernum]+self.q[j] <= self.vehicle['K']*self.x.sum(j+1,'*')),name='capacity')
         # time
         for j in range(self.portnum):
             if j == 0:
@@ -111,23 +137,26 @@ class _SubProblemLP:
             else:
                 # port load/unload time
                 self.prob.addConstr((self.tl[j] + self.M_t*(1 - self.x.sum('*', j)) >= self.ta[j] + self.N['s'][j]),name="load_unload_time")
-                # tw
+                # # tw
                 self.prob.addConstr(self.ta[j] + self.M_t*(1 - self.x.sum('*', j)) >= self.N['ltw'][j],name='ltw')
-                self.prob.addConstr(self.ta[j] - self.M_t * (1 - self.x.sum('*', j)) <= self.N['utw'][j],name='utw')
+                self.prob.addConstr(self.ta[j] - self.M_t * (1 - self.x.sum('*', j)) <= self.N['utw'][j], name='utw')
+
         # time recursion between different ports
         self.prob.addConstrs((self.tl[i]+self.G['t'][i][j]-self.ta[j] <= self.M_t*(1-self.x[(i,j)])
                               for i in range(self.portnum) for j in range(self.portnum) if i!=self.portnum-1 and j!=0),name='travel_time')
         # precedence const
-        self.prob.addConstrs((self.tl[i+1] + self.G['t'][i+1][i+1+self.ordernum] - self.ta[i+1+self.ordernum] <= self.M_t * (1 - self.x.sum(i+1,'*')) for i in range(self.ordernum)))
+        self.prob.addConstrs((self.tl[i+1] + self.G['t'][i+1][i+1+self.ordernum] - self.ta[i+1+self.ordernum]
+                                                <= self.M_t * (1 - self.x.sum(i+1,'*')) for i in range(self.ordernum)),'precedence_const')
         # subtour_elimination
-        self.prob.addConstrs((self.u[i] - self.u[j] + self.portnum * self.x[i, j] <= self.portnum - 1 for i in range(self.portnum) for j in range(self.portnum) if i != j),)
+        self.prob.addConstrs((self.u[i] - self.u[j] + self.portnum * self.x[i, j] <= self.portnum - 1
+                                                for i in range(self.portnum) for j in range(self.portnum) if i != j),'subtour_elimination')
 
         # minimize reduced cost
         obj = gp.LinExpr()
         dual_demand = [-i for i in self.duals['demand_const']]
-        # obj.add(-self.ta[self.portnum-1])
-        obj_c = {(i, j): -value for i, row in enumerate(self.G['d']) for j, value in enumerate(row)}
-        obj.add(self.x.prod(obj_c))
+        obj.add(-self.ta[self.portnum-1])
+        # obj_c = {(i, j): -value for i, row in enumerate(self.G['d']) for j, value in enumerate(row)}
+        # obj.add(self.x.prod(obj_c))
         obj.addTerms(dual_demand, list(self.q.values()))
         print(self.duals['route_selection'])
         obj.addConstant(-self.duals['route_selection'])
@@ -143,8 +172,8 @@ class _SubProblemLP:
         new_route = {}
         # TODO 改存储形式
         new_route["route"] = [i for i, item in self.x.items() if item.X == 1]
-        new_route["q"] =[value.X for value in self.q.values()]
-        new_route["cvr"] =self.ta[self.portnum-1].X
+        new_route["q"] =[round(value.X,2) for value in self.q.values()]
+        new_route["cvr"] = round(self.ta[self.portnum-1].X,2)
         self.routes.append(new_route)
 
         logger.debug("new route reduced cost %s" % self.prob.getAttr(gp.GRB.Attr.ObjVal))
@@ -179,12 +208,17 @@ if __name__ == "__main__":
     #               'avail_t':2}
     #          }
     from data_process import data_process
-    G, N, vehicle, orders, init_routes = data_process()
-    duals={"route_selection":2,}
+    G, N, vehicle, orders, init_routes = data_process(15)
+    duals={"route_selection":-2,}
     duals["demand_const"]= [-100 for i in range(len(orders)) ]
     solver='gurobi'
-    m=_SubProblemLP(duals,G['0'],N,orders, vehicle['0'], solver)
-    m.solve(None)
+    vehicle['0']['avail_t']=0
+    a=time.time()
+    print('开始求解时间：',a)
+    m=_SubProblemLP(duals,G['0'],N,orders, vehicle['0'], solver,0)
+    m.solve(300)
+    b=time.time()
+    print('共求解时长：',b-a)
     for i,item in m.x.items():
         if item.X == 1:
             print(i)
@@ -192,6 +226,8 @@ if __name__ == "__main__":
     print(m.ta)
     print(m.tl)
     print(m.l)
+    print('travel time:', m.ta[m.portnum-1])
     print("初始",m.routes)
     m._add_new_route()
     print("after",m.routes)
+    print(m.prob.MIPGap)

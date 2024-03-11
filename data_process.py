@@ -1,18 +1,55 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime,timedelta
 
-def data_process():
 
-    order = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-货盘.csv", encoding='utf-8')
-    vehicle = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-运力.csv", encoding='gbk')
-    port_info = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港口信息表.csv", encoding='utf-8')
-    port_restr = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港口限制表.csv", encoding='utf-8')
-    port_draft = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港口吃水限制.csv", encoding='utf-8')
-    travel = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港间航行表.csv", encoding='utf-8')
+def data_process(order_num=None,ship_num=None):
 
-    travel = travel.drop_duplicates(subset=['开始港口', '结束港口'], keep='first')
+    # order = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-货盘.csv", encoding='utf-8')
+    # vehicle = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-运力.csv", encoding='gbk')
+    # port_info = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港口信息表.csv", encoding='utf-8')
+    # port_restr = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港口限制表.csv", encoding='utf-8')
+    # port_draft = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港口吃水限制.csv", encoding='utf-8')
+    # travel = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-港间航行表.csv", encoding='utf-8')
+    #
+    # travel = travel.drop_duplicates(subset=['开始港口', '结束港口'], keep='first')
+    #
+    # order.to_json('order.json', orient='records')
+    # vehicle.to_json('vehicle.json', orient='records')
+    # port_info.to_json('port_info.json', orient='records')
+    # port_restr.to_json('port_restr.json', orient='records')
+    # port_draft.to_json('port_draft.json', orient='records')
+    # travel.to_json('travel.json', orient='records')
+
+    order = pd.read_json("order.json", orient="records")
+    vehicle = pd.read_json("vehicle.json", orient="records")
+    travel = pd.read_json("travel.json", orient="records")
+
+    # 订单抽样
+    if isinstance(order_num, int):
+        order = order.sample(n=order_num, replace=False)
+        print(order.index)
+        order = order.reset_index(drop=True)
+    elif isinstance(order_num, list):
+        order = order.iloc[order_num].reset_index(drop=True)
+        order = order.reset_index(drop=True)
+    else:
+        print('order应指定订单抽样数量或者index的索引列表')
+        print('默认使用全部订单')
     n = len(order)
+
+    # ship 抽样
+    if isinstance(ship_num, int):
+        vehicle = vehicle.sample(n=ship_num, replace=False)
+        print(vehicle.index)
+        vehicle = vehicle.reset_index(drop=True)
+    elif isinstance(ship_num, list):
+        vehicle = vehicle.iloc[ship_num].reset_index(drop=True)
+        vehicle = vehicle.reset_index(drop=True)
+    else:
+        print('ship应指定船只抽样数量或者index的索引列表')
+        print('默认使用全部船只')
+
 
     # N
     data_format = '%Y-%m-%d %H:%M:%S'
@@ -25,19 +62,24 @@ def data_process():
     for i in range(n):
         date = utw_p[i]
         if order.iloc[i]['允许跨月'] == '不允许':
-            # 下个月第一天
+            # 下个月第一天0点，即不允许跨月
             if date.month == 12:
-                next_month = date.replace(day=1, year=date.year + 1, month=1,hour=0)
+                next_month = date.replace(day=1, year=date.year + 1, month=1, hour=0)
             else:
-                next_month = date.replace(day=1, month=date.month + 1,hour=0)
+                next_month = date.replace(day=1, month=date.month + 1, hour=0)
+            # 检测数据错误:不允许跨月由于航行时长必然不能被满足的订单，若有，则允许跨一个月
+            bool_index = [a and b for a, b in zip(travel['开始港口'] == order.iloc[i]['装货港口代码'],
+                                                  travel['结束港口'] == order.iloc[i]['卸货港口代码'])]
+            time_direct = ltw_p[i] + timedelta(hours=travel[bool_index]['航行时间（小时）'].iloc[0])
+            if time_direct >= next_month:
+                if time_direct.month == 12:
+                    next_month = time_direct.replace(year=time_direct.year + 1, month=1,day=1,hour=0,minute=0,second=0)
+                else:
+                    next_month = time_direct.replace(month=time_direct.month + 1,day=1,hour=0,minute=0,second=0)
+                print(ltw_p[i],travel[bool_index]['航行时间（小时）'].iloc[0],time_direct,next_month)
+
             utw_d.append(next_month)
         else:
-            # if date.month == 12:
-            #     next_month = date.replace(day=1, year=date.year + 1, month=2,hour=0)
-            # elif date.month == 11:
-            #     next_month = date.replace(day=1, year=date.year + 1, month=1, hour=0)
-            # else:
-            #     next_month = date.replace(day=1, month=date.month + 2, hour=0)
             next_year = date.replace(day=1, year=date.year + 1,  hour=0)
             utw_d.append(next_year)
     ## 规划视窗的最早时间及最晚时间
@@ -68,25 +110,32 @@ def data_process():
     vehicle_dict = vehicle[['mmsi', '运力释放港口', 'avail_t', 'K']].to_dict(orient='index')
 
     # travel_time
+    # 多个订单的始发地一样，应该要变成0；始发地和终到地一样；终到地一样
     travel_time = np.full((2 * n, 2 * n), 1.1*N['utw'][0])
     for i in range(2 * n):
         port_s = order.iloc[i]['装货港口代码'] if i < n else order.iloc[i - n]['卸货港口代码']
         for j in range(2 * n):
             port_e = order.iloc[j]['装货港口代码'] if j < n else order.iloc[j - n]['卸货港口代码']
+            if port_s==port_e:
+                travel_time[i, j] = 0
             if port_e in list(travel[travel['开始港口'] == port_s]['结束港口']):
                 bool_index = [a and b for a, b in zip(travel['开始港口'] == port_s, travel['结束港口'] == port_e)]
                 travel_time[i, j] = travel[bool_index]['航行时间（小时）'].iloc[0]
     # G
+
     G_all={}
     for i in vehicle.index:
         G_v = np.full((2 * n + 2, 2 * n + 2), 1.1*N['utw'][0])
         G_v[:, 2 * n + 1] = 0
-        avail_port = vehicle_dict['0']['运力释放港口']
-        for j in range(n):
+        avail_port = vehicle_dict[str(i)]['运力释放港口']
+        for j in range(n+1):
             if j == 0:
                 G_v[0, j] = 0
+            # 车辆出发地和pickup点一样，应该要变成0；
+            elif avail_port==order.iloc[j-1]['装货港口代码']: #G里的port j 实际上是order j-1 的pickup点
+                G_v[0, j] = 0
             else:
-                port_e = order.iloc[j]['装货港口代码']
+                port_e = order.iloc[j-1]['装货港口代码']
                 if port_e in list(travel[travel['开始港口'] == avail_port]['结束港口']):
                     bool_index = [a and b for a, b in
                                   zip(travel['开始港口'] == avail_port, travel['结束港口'] == port_e)]
@@ -120,15 +169,19 @@ def data_process():
 
 if __name__ =="__main__":
 
-    G_all,N,vehicle_dict,orders,init_routes=data_process()
+    G_all,N,vehicle_dict,orders,init_routes=data_process([6,11,13,26,36],[0,3])
+    print(vehicle_dict)
     G0 = G_all['0']['t']
     tap = []
     tad = []
-    for i in range(1, 42):
+    n=len(orders)
+    for i in range(1, n+1):
         tap.append(vehicle_dict['0']['avail_t'] + G0[0][i])
-        tad.append(tap[i-1]+2+G0[i][42+i])
-    print(all([a > b for a, b in zip(tap, N['utw'][1:43])]))
-    print(all([a > b for a, b in zip(tad, N['utw'][43:86])]))
+        tad.append(tap[i-1]+2+G0[i][n+i])
+    print(all([a > b for a, b in zip(tap, N['utw'][1:n])]))
+    print(all([a > b for a, b in zip(tad, N['utw'][n+1:2*n+1])]))
+    print(tap)
+    print(N['utw'][1:n])
     print(tad)
-    print(N['utw'][43:86])
+    print(N['utw'][n+1:2*n+1])
 
