@@ -36,6 +36,7 @@ class _SubProblemLP:
         # create problem
         self.prob = gp.Model("SubProblem")
         # self.prob.setParam('OutputFlag', 0)
+        self.prob.setParam('Threads', 12)
 
 
         # # 终止条件：设置目标值大于指定值时终止的阈值
@@ -57,12 +58,21 @@ class _SubProblemLP:
      # 创建回调函数，在其中检查终止条件
     def _gap_and_obj_stop_callback(self,model, where):
         if where == gp.GRB.Callback.MIPSOL:
-            # 检查当前最优目标值是否大于指定值，并且满足 gap 条件
-            gap = ((model.cbGet(gp.GRB.Callback.MIPSOL_OBJBND) - model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST)) / abs(
-                model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST)))
-
-            if model.cbGet(gp.GRB.Callback.MIPSOL_OBJ) > self.target_value_threshold and gap < self.subGap:
+            if model.cbGet(gp.GRB.Callback.MIPSOL_OBJBND) < 0: # 最大化问题，这里即为上界
                 model.terminate()
+            else:
+                # 当前可行解目标值大于0，才继续判断是否满足终止条件；若不大于0，则继续迭代即可
+                if model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST) > 0: # 可行解最优值
+                    # 检查当前最优目标值是否大于指定值，并且满足 gap 条件
+                    gap = ((model.cbGet(gp.GRB.Callback.MIPSOL_OBJBND) - model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST))
+                           / model.cbGet(gp.GRB.Callback.MIPSOL_OBJBST))
+                    print(self.subGap)
+                    print(gap)
+                    print(gp.GRB.Callback.MIPSOL_OBJ)
+                    print(self.target_value_threshold)
+
+                    if model.cbGet(gp.GRB.Callback.MIPSOL_OBJ) > self.target_value_threshold and gap < self.subGap:
+                        model.terminate()
 
     def solve(self, time_limit=None):
         if time_limit and time_limit <= 0:
@@ -170,7 +180,6 @@ class _SubProblemLP:
 
     def _add_new_route(self):
         new_route = {}
-        # TODO 改存储形式
         new_route["route"] = [i for i, item in self.x.items() if item.X == 1]
         new_route["q"] =[round(value.X,2) for value in self.q.values()]
         new_route["cvr"] = round(self.ta[self.portnum-1].X,2)

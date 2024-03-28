@@ -3,7 +3,7 @@ import numpy as np
 from datetime import datetime,timedelta
 
 
-def data_process(order_num=None,ship_num=None):
+def data_process(order_num=None,ship_num=None,is_mass_cargo=True):
 
     # order = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-货盘.csv", encoding='utf-8')
     # vehicle = pd.read_csv(r"D:\university\实习\SRIBD\中远数据\month1\输入-运力.csv", encoding='gbk')
@@ -25,11 +25,23 @@ def data_process(order_num=None,ship_num=None):
     vehicle = pd.read_json("vehicle.json", orient="records")
     travel = pd.read_json("travel.json", orient="records")
 
-    # 订单抽样
-    if isinstance(order_num, int):
+    # 订单抽样   8800 0.28为界分组，最大抽样数20
+    if isinstance(order_num, int):  # 28,38,
+        # 创建一个要排除的索引列表
+        exclude_indices = [0,27,28,38,39,41] # 35，40，17，19
+        # 进行抽样，指定不抽取的部分
+        order = order.drop(exclude_indices)
+        # 订单货量分组
+        if is_mass_cargo:
+            order = order[order['纸浆装货量（吨）'] >= 9000]
+        else:
+            order = order[order['纸浆装货量（吨）'] < 9000]
+
         order = order.sample(n=order_num, replace=False)
+
         print(order.index)
         order = order.reset_index(drop=True)
+
     elif isinstance(order_num, list):
         order = order.iloc[order_num].reset_index(drop=True)
         order = order.reset_index(drop=True)
@@ -37,19 +49,22 @@ def data_process(order_num=None,ship_num=None):
         print('order应指定订单抽样数量或者index的索引列表')
         print('默认使用全部订单')
     n = len(order)
-
+    # 创建一个要排除的船索引列表
+    exclude_vehicle = [3] # 5,7
     # ship 抽样
     if isinstance(ship_num, int):
+        vehicle = vehicle.drop(exclude_vehicle)
         vehicle = vehicle.sample(n=ship_num, replace=False)
         print(vehicle.index)
-        vehicle = vehicle.reset_index(drop=True)
+        vehicle = vehicle.reset_index(drop=False)
     elif isinstance(ship_num, list):
         vehicle = vehicle.iloc[ship_num].reset_index(drop=True)
         vehicle = vehicle.reset_index(drop=True)
     else:
+        vehicle = vehicle.drop(exclude_vehicle)
+        vehicle = vehicle.reset_index(drop=False)
         print('ship应指定船只抽样数量或者index的索引列表')
-        print('默认使用全部船只')
-
+        print('默认使用除禁用外的全部船只')
 
     # N
     data_format = '%Y-%m-%d %H:%M:%S'
@@ -100,7 +115,7 @@ def data_process(order_num=None,ship_num=None):
     N['ltw'] = ltw_h
     N['utw'] = utw_h
     #
-    N['s'] = [2 for i in range(2*n+2)]
+    N['s'] = [0 for i in range(2*n+2)]
 
     # vehicle
     vt_h = [(dt - min_d).total_seconds() / 3600 for dt in v_t]
@@ -155,9 +170,13 @@ def data_process(order_num=None,ship_num=None):
 
     # init_routes
 
-    dummy_route = [{'route': [(0, 0), ],
-                    'q': [0 for i in range(n)],
-                    'cvr': 0, },
+    dummy_route = [{'route': [(0, 0),],
+     'q': [[0 for i in range(n)],],
+     'cvr': 0,
+     'time': [0],
+     'time_cost': 0,
+     'load': [[],],
+     'split': [[],]},
                    ]
     init_routes={}
     for i in vehicle_dict.keys():
