@@ -86,7 +86,7 @@ def data_generate(n,cargo_size,W,T=600,seed=2,L=50,K=[90,120,150],number_vehicle
     orders = []
     load = create_load(n, seed, round(min(K) * cargo_size[0]), round(min(K) * cargo_size[1]))
     for i in range(n):
-        temp = {'R': 100, 'C': 200}
+        temp = {'R': 100, 'C': 2000}
         temp['id']=i
         temp['Q']=load[i]
         orders.append(temp)

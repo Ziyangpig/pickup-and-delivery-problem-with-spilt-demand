@@ -14,7 +14,6 @@ class _SubProblemLP:
 
     Inherits problem parameters from `SubproblemBase`
     """
-
     def __init__(self, duals,G,N,orders, vehicle, solver, gap=0):
         # Input attributes
         self.G = G

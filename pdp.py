@@ -3,8 +3,8 @@ import sys
 from time import time
 from MasterProblem import _MasterSolve
 from subproblem import _SubProblemLP
-from data_process import data_process
 from subproblem_labelsetting import SP1
+from cuts import update_A,separation_customer_cut,update_master_customer_cuts
 from data_generate import create_pd_DiGragh
 from data_generate import data_generate
 import json
@@ -63,6 +63,8 @@ class VehicleRoutingProblem:
         self.num_arcs_to_consider = round(len(self.orders)/2,0)
         self.paths_per_itter = 4
         self.sub_heuristic = False
+        # cuts
+        self.add_cuts = False
 
 
     def solve(
@@ -71,7 +73,8 @@ class VehicleRoutingProblem:
             time_limit=None,
             solver="gurobi",  # gurobi , label
             max_iter=None,
-            sub_heuristic = False
+            sub_heuristic = False,
+            add_cuts = False,
 
     ):
         """Iteratively generates columns with negative reduced cost and solves as MIP.
@@ -87,6 +90,7 @@ class VehicleRoutingProblem:
         self._max_iter = max_iter
         self._start_time = time()
         self.sub_heuristic = sub_heuristic
+        self.add_cuts = add_cuts
 
         if initial_routes:
             self._initial_routes = initial_routes
@@ -111,6 +115,7 @@ class VehicleRoutingProblem:
         #     self._get_initial_solution()
 
         # Init master problem
+
         self.masterproblem = _MasterSolve(
             self.vehicle,
             self._initial_routes,
@@ -118,7 +123,7 @@ class VehicleRoutingProblem:
             True,
             self._solver,
         )
-        self.routes = self._initial_routes
+        self.routes = deepcopy(self._initial_routes)
 
     def _solve(self):
         self._column_generation()
@@ -129,10 +134,12 @@ class VehicleRoutingProblem:
             self.orders,
             False,
             self._solver,
+            self.masterproblem.A,
+            self.masterproblem.cuts
         )
         self.masterproblem.solve(relax=False, time_limit=self._get_time_remaining(mip=True))
         #(self._best_value,self._best_routes_as_graphs,) = self.masterproblem.get_total_cost_and_routes(relax=False)
-        print(self.masterproblem.get_solution())
+
 
         # self._post_process(solver)
 
@@ -164,9 +171,18 @@ class VehicleRoutingProblem:
     def _find_columns(self):
         # "Solves masterproblem and pricing problem."
         # Solve restricted relaxed master problem
+
         self.masterproblem.prob.setParam('OutputFlag', 0)
         print("RMP求解")
         duals, relaxed_cost = self.masterproblem.solve(relax=True, time_limit=self._get_time_remaining())
+        # 添加cut
+        if self.add_cuts and self.routes != self._initial_routes:
+            theta = self.masterproblem.get_theta()
+            new_cuts,self.masterproblem.cuts=separation_customer_cut(self.masterproblem.A, len(self.orders), theta, self.masterproblem.cuts)
+            if len(new_cuts):
+                self.masterproblem=update_master_customer_cuts(self.masterproblem,self.masterproblem.A, self.masterproblem.cuts)
+                self.masterproblem.prob.update()
+                duals, relaxed_cost = self.masterproblem.solve(relax=True, time_limit=self._get_time_remaining())
         print("iteration %s,obj %s" % (self._iteration, relaxed_cost))
         if self._solver == 'gurobi':
             print("子问题gap设置： %s" % self.sub_initial_gap)
@@ -183,6 +199,7 @@ class VehicleRoutingProblem:
                 dual={}
                 dual["route_selection"]=duals["route_selection"][v]
                 dual["demand_const"]=duals["demand_const"]
+                cij = self.calculate_cost_matrix(v,duals,self.masterproblem.cuts)
                 a = time()
                 if self._solver == 'gurobi':
                     print(dual)
@@ -200,7 +217,8 @@ class VehicleRoutingProblem:
                             r_copy['load'] = l
                             r_copy['split'] = s
                             paths.append(r_copy)
-                    temp_routes, self._more_routes = subproblem.calculate_H1(paths)
+
+                    temp_routes, self._more_routes = subproblem.calculate_H1(paths,cij)
 
                 if self._more_routes:
                     self._add_routes(temp_routes, v)
@@ -241,6 +259,8 @@ class VehicleRoutingProblem:
             self.orders,
             True,
             self._solver,
+            self.masterproblem.A,
+            self.masterproblem.cuts
         )
 
         self._iteration += 1
@@ -249,7 +269,34 @@ class VehicleRoutingProblem:
         else:
             self._no_improvement = 0
         self._lower_bound.append(relaxed_cost)
-
+    def calculate_cost_matrix(self,v,duals,cuts):
+        if self.masterproblem.cuts:
+            """
+            Calculates dij by substituting the dual variables of master problem solution 
+            """
+            n = len(self.orders)
+            dij = deepcopy(self.G[str(v)]['d'])
+            # 遍历 i、j、k 的组合
+            th=[-10000 for i in range(n)]
+            for j in range(n):
+                for i in range(2*n+2):
+                    for k in range(2*n+2):
+                        temp = dij[i][k] - dij[i][n + j] - dij[n + j][k]
+                        if temp > th[j]:
+                            th[j] = temp
+            for i in range(1,n+1):
+                temp_i = sum([duals['customer_cut'][cut_id] for cut_id,cut in enumerate(cuts) if i in cut])
+                for j in range(1,2*n+1):
+                    dij[i, j] += temp_i
+            # transform to meet triangle inequality
+            for i in range(1,n+1):
+                for j in range(2*n+2):
+                    if i!=0:
+                        dij[i, j] -= th[i-1]
+                        dij[i+n, j] += th[i - 1]
+            return dij
+        else:
+            return self.G[str(v)]['t']
     def _add_routes(self,temp_routes,v):
         print('车辆标号：', v)
         print('当前迭代返回路线数量参数为：',self.paths_per_itter)
@@ -290,6 +337,7 @@ class VehicleRoutingProblem:
                     r['load'] = [r['load'], ]
                     r['split'] = [r['split'], ]
                 self.routes[str(v)] =self.routes[str(v)]+[r]
+                self.masterproblem.A=update_A(self.masterproblem.A, [r], v, len(self.orders))
                 print('添加新路线：',r)
 
 
@@ -307,7 +355,7 @@ class VehicleRoutingProblem:
             # 数据转化 根据 self.G,self.N, self.orders, self.vehicle 转到datadict
             data_dict={}
             data_dict["distances"] = self.G[str(v)]['d']
-            # dij = calculate_cost_matrix(data_dict, duals)
+
             data_dict["num_of_requests"] = len(self.orders)
             load=[0]+[x['Q'] for x in self.orders]
             for i in range(len(self.orders) + 1, 2 * len(self.orders) + 1):
@@ -347,7 +395,7 @@ class VehicleRoutingProblem:
 
 if __name__ == "__main__":
     seed = 2
-    n, cargo_size = 10,[0.3,0.8]
+    n, cargo_size = 20,[0.3,0.8]
     K,number_vehicle = [90, 120, 150],10
     W, T = 60,600
     L = 80 # 运输区域边长
@@ -369,13 +417,15 @@ if __name__ == "__main__":
 
     # N['utw']=[N['utw'][0] for i in range(len(N['utw']))]
     VRP=VehicleRoutingProblem(G,N,vehicle,orders)
-    VRP.solve(init_routes,None,'label',1000,True)
+    VRP.solve(init_routes,None,'label',1000,True,False)
     b=time()
-    # for i,r in VRP.routes.items():
-    #     print(i,r)
-    print(vehicle, '\n', orders, '\n', N)
+    for i,r in VRP.routes.items():
+        print(i,r)
+    print(VRP.masterproblem.print_solution())
+    print('车辆信息',vehicle, '\n', '订单信息：',orders, '\n', N)
     print('求解时间：', b - a)
     print(VRP.iter_time)
     # print(VRP.masterproblem.prob.MIPGap)
     print('迭代次数：',VRP._iteration,'结果未改善次数：',VRP._no_improvement)
+    print(VRP.masterproblem.cuts)
 

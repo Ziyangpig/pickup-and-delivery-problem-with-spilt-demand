@@ -1,6 +1,7 @@
 import gurobipy as gp
 import sys
 import logging
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +12,14 @@ class _MasterSolve():
     Solves the master problem for the column generation procedure.
 
     """
-    def __init__(self,  vehicle:dict=None, routes:dict=None, orders:list=None, relax:bool= None,solver='gurobi'):
+    def __init__(self, vehicle:dict=None, routes:dict=None, orders:list=None, relax:bool= None, solver='gurobi', A=None,
+                 cuts=None):
+        if cuts is None:
+            cuts = []
+        if A is None:
+            A = {}
+            for v in vehicle.keys():
+                A[v]=[]
         self.vehicle = vehicle
         self.routes = routes
         self.orders = orders
@@ -24,6 +32,9 @@ class _MasterSolve():
         self.y = {}  # chartering variable
         self.x = {}  # route selection variable vr
         self.theta = {}
+
+        self.cuts = cuts
+        self.A = A
 
         # Parameter when minimizing global span
         self._n_columns = 1000
@@ -39,22 +50,34 @@ class _MasterSolve():
         # Route selection variables
         if relax:
             for i,_ in self.routes.items():
-                self.x[i] = self.prob.addVar(lb=0,ub=1,vtype = gp.GRB.CONTINUOUS,name='x0')
+                self.x[i] = self.prob.addVar(lb=0,ub=1,vtype = gp.GRB.CONTINUOUS,name=f'x0_{i}')
             # chartering variable
-            for item in self.orders:
-                self.y[item['id']] = self.prob.addVar(0,1,vtype = gp.GRB.CONTINUOUS,name='y')
+            for i in range(len(self.orders)):
+                self.y[i] = self.prob.addVar(0,1,vtype = gp.GRB.CONTINUOUS,name=f'y{i}')
         else:
             for i,r in self.routes.items():
-                self.x[i] = self.prob.addVars(len(r),lb=0,ub=1,vtype = gp.GRB.BINARY,name='x')
+                self.x[i] = self.prob.addVars(len(r),lb=0,ub=1,vtype = gp.GRB.BINARY,name=f'x{i}')
             # chartering variable
-            for item in self.orders:
-                self.y[item['id']] = self.prob.addVar(0,1,vtype = gp.GRB.BINARY,name='y')
+            for i in range(len(self.orders)):
+                self.y[i] = self.prob.addVar(0,1,vtype = gp.GRB.BINARY,name=f'y{i}')
         # ratio variables of delivery pattern
         for i, v in self.routes.items():
             self.theta[i] = []
             for r in range(len(v)):
                 # {'0':[route1 的一组变量,route 2 的一组变量,],}
-                self.theta[i].append(self.prob.addVars(len(v[r]['q']),lb=0,ub=1,vtype = gp.GRB.CONTINUOUS,name='theta'))
+                self.theta[i].append(self.prob.addVars(len(v[r]['q']),lb=0,ub=1,vtype = gp.GRB.CONTINUOUS,name=f'theta{i}'))
+
+        # add cuts
+        if self.cuts is not []:
+            for cut in self.cuts:
+                cut = list(cut)
+                temp_expr = gp.LinExpr()
+                for v, rs in self.A.items():
+                    for r in range(len(rs)):
+                        temp_expr.add(self.theta[v][r].sum(), np.sum(rs[r][cut]))
+                self.prob.addConstr(temp_expr <= 2, name="customer_cut")
+
+
 
         # add links between x and theta
         if relax:
@@ -81,6 +104,8 @@ class _MasterSolve():
                     q = dict([[w,pattern[item['id']]] for w,pattern in enumerate(route['q'])])
                     temp_LinExpr.add(self.theta[i][r].prod(q))
             self.prob.addConstr((temp_LinExpr >= item['Q']*(1-self.y[item['id']])),name="demand_const")
+#
+
 
         # Set objective function
         costs = [-order['C'] for order in self.orders]
@@ -136,15 +161,17 @@ class _MasterSolve():
         Returns:
             dict: Duals with constraint names as keys and dual variables as values
         """
-        duals = {"route_selection":[],"demand_const":[],}
+        duals = {"route_selection":[],"demand_const":[],"customer_cut":[]}
         for constr in self.prob.getConstrs():
             if constr.ConstrName == "route_selection":
                 duals["route_selection"].append(constr.Pi)
             elif constr.ConstrName == "demand_const":
                 duals["demand_const"].append(constr.Pi)
+            elif constr.ConstrName == "customer_cut":
+                duals["customer_cut"].append(constr.Pi)
         return duals
 
-    def get_solution(self):
+    def print_solution(self):
         for v,routes in self.routes.items():
             if self.x[v][0].X == 1:
                 print(f"船{v}未使用")
@@ -152,7 +179,7 @@ class _MasterSolve():
                 for r, route in enumerate(routes):
                     if r != 0 and self.x[v][r].X == 1:
                         # dict 形式，存放车v路线r的各pattern的比例值
-                        print(f'船{v}使用，其路线：', route['route'])
+                        print(f'船{v}使用，其路线：', route)
                         print(self.theta[v][r])
                         theta_vr = self.prob.getAttr("X", self.theta[v][r])
                         print('配送模式比例',theta_vr)
@@ -161,6 +188,17 @@ class _MasterSolve():
                             q_sum = [qs + ratio * qi for qs,qi in zip(q_sum,route['q'][w])]
                         print(f'船{v}装载情况：',q_sum)
         print('订单外包情况：', self.y)
+    def get_theta(self):
+        theta_vr={}
+        for v,routes in self.routes.items():
+            theta_vr[v]=[]
+            for r, route in enumerate(routes):
+                if r == 0:
+                    theta_vr[v].append(self.x[v].X)
+                else:
+                    theta_vr[v].append(sum(self.prob.getAttr("X", self.theta[v][r]).values()))
+        return theta_vr
+
 
 
 
