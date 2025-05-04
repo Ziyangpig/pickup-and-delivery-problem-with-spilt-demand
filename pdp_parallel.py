@@ -1,0 +1,517 @@
+import logging
+import logging.handlers
+import queue
+
+import sys
+from time import time
+from MasterProblem import _MasterSolve
+from subproblem import _SubProblemLP
+from subproblem_labelsetting import SP1
+from cuts import update_A,separation_customer_cut,update_master_customer_cuts
+from data_generate import create_pd_DiGragh
+from data_generate import data_generate
+import json
+from copy import deepcopy
+from math import ceil
+
+from joblib import Parallel, delayed
+import multiprocessing
+
+num_processes = max(1, multiprocessing.cpu_count() - 2) 
+# 日志队列
+log_queue = queue.Queue(-1)
+# 控制台输出handler
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+# 队列监听器
+queue_listener = logging.handlers.QueueListener(log_queue, stream_handler)
+queue_listener.start()
+
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.INFO)
+for name in logging.root.manager.loggerDict:
+    if name.startswith('matplotlib'):
+        logging.getLogger(name).setLevel(logging.INFO)
+
+def _solve_vehicle_subproblem(v,cij, data_dict, paths):
+    """
+    Solve the subproblem for a single vehicle.
+
+    """
+    qh = logging.handlers.QueueHandler(log_queue)
+    logger.addHandler(qh)
+    
+    logger.info("子问题 船id： %s" % v)
+
+    a = time()
+    g = create_pd_DiGragh(data_dict["num_of_requests"])
+    subproblem = SP1(g, data_dict,data_dict['num_arcs_to_consider'],data_dict['paths_per_itter'],data_dict['sub_heuristic'])
+
+    # 把self.routes[str(v)]里路线相同配送模式不同的路线拆开，适应子问题输入
+
+    temp_routes, has_more = subproblem.calculate_H1(paths,cij)
+
+    b = time()
+    logger.info(f'子问题求解时间：{b-a}',)
+    logger.removeHandler(qh)
+    
+    return v, temp_routes, has_more
+class VehicleRoutingProblemParallel:
+    def __init__(
+            self,
+            G,
+            N,
+            vehicle : dict, #[{'capcity': 'weight' 'o' 'd' 'st' }
+            orders : list, #[{P,D,TW,C,R,Q}]
+
+    ):
+        self.G = G
+        self.N = N
+        self.vehicle = vehicle
+        self.orders = orders
+
+        self._initial_routes = {}
+        #
+        self.masterproblem: _MasterSolve = None
+        self.routes=  {}
+        self.comp_time = None
+
+        # Input solving parameters
+        self._solver: str = None
+        self._time_limit: int = None
+        self._max_iter: int = None
+        self._run_exact = None
+
+        # parameters for column generation stopping criteria
+        self._start_time = None
+        self._more_routes = None
+        self._all_more_routes  = None
+        self._iteration = 0  # current iteration
+        self._no_improvement = 0  # iterations after with no change in obj func
+        self._lower_bound = []
+        
+        self.master_gap = 0.05
+
+        # Parameters for final solution
+        self._best_value = None
+        self._best_routes = []
+
+        self.iter_time = []
+        self.master_iter_time = []
+        self.sub_iter_time = []
+        self.check_gap_time =[]
+
+        # parameters for Subproblem efficiency gurobi
+        
+        self.sub_initial_gap = 2.5
+        self.k = 0.8
+        # label
+        self.num_arcs_to_consider = round(len(self.orders)/2,0)
+        self.paths_per_itter = 4
+        self.sub_heuristic = False
+        # cuts
+        self.add_cuts = False
+
+
+    def solve(
+            self,
+            initial_routes=None,
+            time_limit=None,
+            solver="label",  #  label #GUROBI 并行待扩展
+            max_iter=None,
+            sub_heuristic = False,
+            add_cuts = False,
+
+    ):
+        """Iteratively generates columns with negative reduced cost and solves as MIP.
+
+        Returns:
+            float: Optimal solution of MIP based on generated columns
+        """
+        # set solving attributes
+        self._more_routes = True
+        self._all_more_routes = True
+        self._solver = solver
+        self._time_limit = time_limit
+        self._max_iter = max_iter
+        self._start_time = time()
+        self.sub_heuristic = sub_heuristic
+        self.add_cuts = add_cuts
+
+        if initial_routes:
+            self._initial_routes = initial_routes
+
+        # If only one type of vehicle, some formatting is done
+
+        # Pre-processing
+        # self._pre_solve()
+
+        # Initialization
+        self._initialize()
+        # Column generation procedure
+        self._solve()
+
+    def _initialize(self):
+        """Initialization with feasible solution."""
+        # if self._initial_routes:
+        #     # Initial solution is given as input
+        #     check_initial_routes(initial_routes=self._initial_routes, G=self.G)
+        # else:
+        #     # Initial solution is computed with Clarke & Wright (or round trips)
+        #     self._get_initial_solution()
+
+        # Init master problem
+
+        self.masterproblem = _MasterSolve(
+            self.vehicle,
+            self._initial_routes,
+            self.orders,
+            True,
+            self._solver,
+        )
+        self.routes = deepcopy(self._initial_routes)
+
+    def _solve(self):
+        self._column_generation()
+        # Solve as MIP
+        self.masterproblem = _MasterSolve(
+            self.vehicle,
+            self.routes,
+            self.orders,
+            False,
+            self._solver,
+            self.masterproblem.A,
+            self.masterproblem.cuts
+        )
+        self.masterproblem.solve(relax=False, time_limit=self._get_time_remaining(mip=True))
+        
+        #(self._best_value,self._best_routes_as_graphs,) = self.masterproblem.get_total_cost_and_routes(relax=False)
+
+
+        # self._post_process(solver)
+
+    def _column_generation(self):
+        while self._all_more_routes:
+            # Generate good columns
+            a = time()
+            self._find_columns() # 执行一次RMP和所有的子问题
+            b = time()
+            self.iter_time.append(b-a)
+            print('一次列生成迭代时间:',b-a)
+            
+            if self._solver == 'gurobi':
+                self.sub_initial_gap *= self.k
+            elif self._solver == 'label':
+                self.paths_per_itter += ceil(self._iteration/5)
+            # Stop if time limit is passed
+            if (
+                isinstance(self._get_time_remaining(), float)
+                and self._get_time_remaining() == 0.0
+            ):
+                logger.info("time up !")
+                break
+            # Stop if no improvement limit is passed or max iter exceeded
+            if self._no_improvement > 10 or (
+                self._max_iter and self._iteration >= self._max_iter
+            ):
+                break
+            # 每5次解一次MIP问题，达到gap就退出
+            
+            if self._iteration % 5 == 0:
+                a3 = time()
+                check_master = _MasterSolve(
+                        self.vehicle,
+                        self.routes,
+                        self.orders,
+                        False,
+                        self._solver,
+                        self.masterproblem.A,
+                        self.masterproblem.cuts
+                    )
+                check_master.solve(relax=False, time_limit=self._get_time_remaining(mip=True))
+                b3 = time()
+                self.check_gap_time.append(b3 - a3)
+                # if check_master.prob.MIPGap < self.master_gap:
+                #     self.masterproblem = check_master
+                #     break
+           
+
+    
+    def _prepare_task_data(self, v, duals):
+        """为每个 v 生成独立的数据副本，避免多进程间数据冲突"""
+        # 提取与 v 相关的数据
+
+        cij = self.G[str(v)]['t']
+        
+        # 构建 data_dict
+        data_dict = {
+            "distances": self.G[str(v)]['d'],
+            "num_of_requests": len(self.orders),
+            "load": self._generate_load_data(),  # 将 load 生成逻辑封装到方法中
+            "dual_alpha": duals["demand_const"],
+            "route_selection": duals["route_selection"][v],
+            "time_windows": [[l,u] for l,u in zip([self.vehicle[str(v)]['avail_t']]+self.N['ltw'][1:],self.N['utw'])],
+            "vehicle_speed": 1,
+            "vehicle_capacity": self.vehicle[str(v)]['K'],
+            "num_arcs_to_consider": self.num_arcs_to_consider,
+            "paths_per_itter": self.paths_per_itter,
+            "sub_heuristic": self.sub_heuristic
+        }
+        
+        # 生成 paths
+        paths = []
+        keys = ['q', 'load', 'split']
+        for r in self.routes[str(v)]:
+            for q, l, s in zip(*list(map(lambda x: r[x], keys))):
+                r_copy = deepcopy(r)
+                r_copy.update({'q': q, 'load': l, 'split': s})
+                paths.append(r_copy)
+        
+        return v, cij, data_dict, paths
+
+    def _generate_load_data(self):
+        """ load 数据"""
+        load = [0] + [x['Q'] for x in self.orders]
+        for i in range(len(self.orders) + 1, 2 * len(self.orders) + 1):
+            load.append(-load[i - len(self.orders)])
+        load.append(0)
+        return load
+        
+    def _find_columns(self):
+        # "Solves masterproblem and pricing problem."
+        # Solve restricted relaxed master problem
+        
+        a1 = time()
+
+        self.masterproblem.prob.setParam('OutputFlag', 0)
+        logger.info("RMP求解")
+        duals, relaxed_cost = self.masterproblem.solve(relax=True, time_limit=self._get_time_remaining())
+        b1 = time()
+        self.master_iter_time.append(b1 - a1)
+
+        # One subproblem per vehicle type
+        iters = 0
+        a2 = time()
+        while True: # 不断增加考虑边数，以及启发转精确
+
+            results = Parallel(n_jobs=num_processes , backend="multiprocessing")(
+                delayed(_solve_vehicle_subproblem)(*self._prepare_task_data(v, duals))
+                for v in range(len(self.vehicle))
+            )
+            # 主进程统一处理
+            route_statas = []  
+            for v, temp_routes, has_more in sorted(results, key=lambda x: x[0]):
+                if has_more:
+                    self._add_routes(temp_routes, v)
+                route_statas.append(has_more)
+
+            iters =+ 1
+            # Keep track of convergence rate and update stopping criteria parameters
+            self._all_more_routes = True
+            if all(stata is False for stata in route_statas):
+                self._all_more_routes = False
+
+            if not self._all_more_routes:
+                if self.num_arcs_to_consider < len(self.orders):
+                    logger.info("未找到路线，增加扩展边数，正在重新调用label算法 %s", iters)
+                    logger.info("当前考虑边数 %s",self.num_arcs_to_consider)
+                    self.num_arcs_to_consider += round(self.num_arcs_to_consider / 2, 0)
+                    self.num_arcs_to_consider = min(self.num_arcs_to_consider, len(self.orders))
+                    logger.info('当前拓展考虑边数：%s', self.num_arcs_to_consider)
+                elif self.sub_heuristic:
+                    logger.info('扩展边数已达最大，开始使用精确标签算法计算')
+                    self.sub_heuristic = False
+                else:
+                    logger.info("没有满足要求的路线，列生成迭代完成")
+                    break
+            else:
+                logger.info(f"当前路线搜寻方法是否为启发式：{self.sub_heuristic},当前考虑边数{self.num_arcs_to_consider}",)
+                logger.info("找到新路线，一次列生成迭代完成")
+                break
+        
+        b2 = time()
+        self.sub_iter_time.append(b2 - a2)
+
+
+        self.masterproblem = _MasterSolve(
+            self.vehicle,
+            self.routes,
+            self.orders,
+            True,
+            self._solver,
+            self.masterproblem.A,
+            self.masterproblem.cuts
+        )
+
+        self._iteration += 1
+        if self._iteration > 1 and relaxed_cost == self._lower_bound[-1]:
+            self._no_improvement += 1
+        else:
+            self._no_improvement = 0
+        self._lower_bound.append(relaxed_cost)
+    def calculate_cost_matrix(self,v,duals,cuts):
+        if self.masterproblem.cuts:
+            """
+            Calculates dij by substituting the dual variables of master problem solution 
+            """
+            n = len(self.orders)
+            dij = deepcopy(self.G[str(v)]['d'])
+            # 遍历 i、j、k 的组合
+            th=[-10000 for i in range(n)]
+            for j in range(n):
+                for i in range(2*n+2):
+                    for k in range(2*n+2):
+                        temp = dij[i][k] - dij[i][n + j] - dij[n + j][k]
+                        if temp > th[j]:
+                            th[j] = temp
+            for i in range(1,n+1):
+                temp_i = sum([duals['customer_cut'][cut_id] for cut_id,cut in enumerate(cuts) if i in cut])
+                for j in range(1,2*n+1):
+                    dij[i, j] += temp_i
+            # transform to meet triangle inequality
+            for i in range(1,n+1):
+                for j in range(2*n+2):
+                    if i!=0:
+                        dij[i, j] -= th[i-1]
+                        dij[i+n, j] += th[i - 1]
+            return dij
+        else:
+            return self.G[str(v)]['t']
+        
+    def _add_routes(self,temp_routes,v):
+        logger.info(f'车辆标号：{v}')
+        logger.info(f'当前迭代返回路线数量参数为：{self.paths_per_itter}')
+        logger.info(f'子问题实际返回的路线数量：{len(temp_routes)}')
+        for r in temp_routes:
+            # 判断新路线及配送是否已存在并找到对应位置
+            existing_route_index = -1
+            existing_pattern_index = -1
+            for i, item in enumerate(self.routes[str(v)]):
+                if item['route'] == r['route']:
+                    existing_route_index = i
+                    if r['q'] in item['q']:
+                        existing_pattern_index = item['q'].index(r['q'])
+                        break
+            # 如果存在，则保留cvr对应的值更小的那个；如果不存在则直接append
+            if existing_route_index != -1:
+                if existing_pattern_index != -1:
+                    logger.info('重复路线生成')
+                    logger.info(f"{r}")
+                    logger.info("%s",self.routes[str(v)][existing_route_index])
+                    if r['cvr'] < self.routes[str(v)][existing_route_index]['cvr']:
+                        self.routes[str(v)][existing_route_index]['cvr'] = r['cvr']
+                        logger.info('更新cvr %s', r)
+                        if self._solver=='label':
+                            self.routes[str(v)][existing_route_index]['time'] = r['time']
+                            self.routes[str(v)][existing_route_index]['time_cost'] = r['time_cost']
+
+                else:
+                    self.routes[str(v)][existing_route_index]['q'] += [r['q']]
+                    logger.info('添加pattern %s', r['q'])
+                    if self._solver == 'label':
+                        self.routes[str(v)][existing_route_index]['load']=self.routes[str(v)][existing_route_index]['load']+[r['load']]
+                        self.routes[str(v)][existing_route_index]['split']+=[r['split']]
+
+            else:
+                r['q'] = [r['q'],]
+                if self._solver == 'label':
+                    r['load'] = [r['load'], ]
+                    r['split'] = [r['split'], ]
+                self.routes[str(v)] =self.routes[str(v)]+[r]
+                self.masterproblem.A=update_A(self.masterproblem.A, [r], v, len(self.orders))
+                logger.info('添加新路线：%s',r)
+
+
+
+
+    def _def_subproblem(
+        self,
+        duals,
+        v,
+        greedy=False,
+    ):
+        """Instanciates the subproblem."""
+
+        if greedy:
+            # 数据转化 根据 self.G,self.N, self.orders, self.vehicle 转到datadict
+            data_dict={}
+            data_dict["distances"] = self.G[str(v)]['d']
+
+            data_dict["num_of_requests"] = len(self.orders)
+            load=[0]+[x['Q'] for x in self.orders]
+            for i in range(len(self.orders) + 1, 2 * len(self.orders) + 1):
+                load.append(-load[i - len(self.orders)])
+            load.append(0)
+            data_dict["load"] = load
+            data_dict["dual_alpha"] = duals["demand_const"]
+            data_dict["route_selection"] = duals["route_selection"]
+            data_dict["time_windows"] = [[l,u] for l,u in zip([self.vehicle[str(v)]['avail_t']]+self.N['ltw'][1:],self.N['utw'])]
+            data_dict["vehicle_speed"] = 1
+            data_dict["vehicle_capacity"] = self.vehicle[str(v)]['K']
+            g = create_pd_DiGragh(data_dict["num_of_requests"])
+            subproblem = SP1(g, data_dict,self.num_arcs_to_consider,self.paths_per_itter,self.sub_heuristic)
+
+        else:
+            # As LP duals,G,N,orders, vehicle, solver
+            # 判断G的第一层key是t/d还是车辆标号，前者说明单车库，后者说明每辆车出发地不一样
+            if 't' in self.G.keys():
+                subproblem = _SubProblemLP(duals,self.G,self.N, self.orders, self.vehicle[str(v)], self._solver,self.sub_initial_gap)
+            else:
+                subproblem = _SubProblemLP(duals, self.G[str(v)], self.N, self.orders, self.vehicle[str(v)], self._solver,self.sub_initial_gap)
+        return subproblem
+
+ 
+    
+    def _get_time_remaining(self, mip: bool = False):
+        """
+        Modified to avoid over time in subproblems.
+
+        """
+        if self._time_limit:
+            remaining_time = self._time_limit - (time() - self._start_time)
+            if mip:
+                return max(500, remaining_time)
+            if remaining_time > 0:
+                return remaining_time
+            return 0.0
+        return None
+
+if __name__ == "__main__":
+    seed = 2
+    n, cargo_size = 5,[0.3,0.8]
+    K,number_vehicle = [90, 120, 150],3
+    W, T = 120,600
+    L = 80 # 运输区域边长
+    G, N, vehicle, orders= data_generate(n,cargo_size,W,T,seed,L,K,number_vehicle)
+    # init_routes
+    dummy_route = [{'route': [(0, 0),],
+     'q': [[0 for i in range(n)],],
+     'cvr': 0,
+     'time': [0],
+     'time_cost': 0,
+     'load': [[],],
+     'split': [[],]},
+                   ]
+    init_routes={}
+    for i in vehicle.keys():
+        init_routes[i]=dummy_route
+    a = time()
+    # G, N, vehicle, orders, init_routes = data_process(14,is_mass_cargo=True) #
+
+    # N['utw']=[N['utw'][0] for i in range(len(N['utw']))]
+    VRP=VehicleRoutingProblem(G,N,vehicle,orders)
+    VRP.solve(init_routes,1200,'label',1000,True,False)
+    b=time()
+    for i,r in VRP.routes.items():
+        print(i,r)
+    print(VRP.masterproblem.print_solution())
+    print('车辆信息',vehicle, '\n', '订单信息：',orders, '\n', N)
+    print('求解时间：', b - a)
+    print(VRP.iter_time)
+    # print(VRP.masterproblem.prob.MIPGap)
+    print('迭代次数：',VRP._iteration,'结果未改善次数：',VRP._no_improvement)
+    print('gap',VRP.masterproblem.prob.MIPGap)
+    print('obj',VRP.masterproblem.prob.ObjVal)
+    # print(VRP.masterproblem.cuts)
+
